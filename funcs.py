@@ -8,7 +8,7 @@ Event keys:  ['Air_puff', 'Baseline_ON', 'Change_ON', 'Eye_cam', 'Front_cam', 'L
               'Lick_L', 'Lick_R', 'Masking_ON', 'Rot_enc_A', 'Rot_enc_B', 'RunningSpeed',
               'Synch', 'Top_cam', 'Valve_L', 'Valve_R', 'frame_times_tr', 'session_name']
               
-Probes keys:  ['BestWaveChannelIdxValid', 'BestWaveChannelRaw', 'NoiseIds', 'WaveForms',
+Probe keys:  ['BestWaveChannelIdxValid', 'BestWaveChannelRaw', 'NoiseIds', 'WaveForms',
                'clu', 'cluster_goodlabels', 'cluster_id_good_and_stable', 'dat_path',
                'dtype', 'good_and_stab_cl_coord', 'hp_filtered', 'n_channels_dat',
                'offset', 'pcFeat', 'pcFeatInd', 'probe_coord', 'sample_rate', 'st',
@@ -77,13 +77,8 @@ def _resolve_reference_array(ref_array, file_handle):
 
 def get_session_data(data_fname, mouse_no, sess_no):
     with h5py.File(data_fname, 'r') as f:
-        all_mouse_ids = list(f.keys())
-        mouse_id = all_mouse_ids[mouse_no]  # 1-indexed, if #0 is '#refs#'
-
-        mouse_data = f[mouse_id]
-        all_sess_ids = list(mouse_data.keys())
-        sess_id = all_sess_ids[sess_no - 1]  # 1-indexed for consistency
-        sess_data = mouse_data[sess_id]
+        # 1-indexed, if #0 is '#refs#'
+        sess_data = f[mouse_no][sess_no]
 
         # Convert each relevant HDF5 group to a Python object
         events_data = load_h5_object(sess_data['NI_events'], f)
@@ -93,6 +88,30 @@ def get_session_data(data_fname, mouse_no, sess_no):
 
         # Return them as plain Python objects (dicts + arrays)
         return events_data, probes_data, video_data, behav_data
+    
+
+def get_probes_metadata_only(data_fname, mouse_no, sess_no):
+    """
+    Returns cluster IDs and brain region info for all probes in a session.
+    Handles multiple probes by returning a list of cluster IDs for each probe.
+    """
+    with h5py.File(data_fname, 'r') as f:
+        sess_data = f[mouse_no][sess_no]
+        
+        # Access NPX_probes group
+        probes_grp = sess_data['NPX_probes']
+        n_probes = len(probes_grp['offset'][()])
+        coord_grp = probes_grp['good_and_stab_cl_coord']
+        cluster_coords = load_h5_object(coord_grp, f)
+        
+        # Initialize storage for multiple probes
+        if n_probes == 1:
+            cluster_ids = probes_grp['cluster_id_good_and_stable'][()]
+        else:
+            cluster_ids = load_h5_object(probes_grp['cluster_id_good_and_stable'], f)
+
+        return cluster_ids, cluster_coords, n_probes
+
 
 
 def convert_regions_to_strings(utf8_dict):
@@ -136,6 +155,7 @@ def bin_spike_times(matched_spikes, session_duration, bin_size_ms=10):
         for unit, spikes in matched_spikes.items()
     }
 
+
 def smooth_firing(matched_spikes_binned, bin_size_ms=10, sigma_ms=30):
     """
     Convolves each neuron's binned spike train with a 1D Gaussian kernel
@@ -161,31 +181,6 @@ def smooth_firing(matched_spikes_binned, bin_size_ms=10, sigma_ms=30):
     return smoothed_spikes_binned
 
 
-def match_unit_firing_to_trial_start_old(smoothed_spikes, trial_times):
-    """
-
-    args:
-        smoothed_spikes (dict): dictionary with units as keys and 
-            smoothed firing rates in bins of 10 ms as values
-        trial_times (dict): dictionary with trial start, duration
-            and end times in seconds
-    
-    returns:
-        dict: {unit: {trial: np.array(spikes)}}        
-    """
-    n_trials = len(trial_times['duration'])
-    trial_aligned_spikes = {}
-    for unit, spikes in smoothed_spikes.items():
-        trial_aligned_spikes[unit] = []
-        for trial in range(n_trials):
-            window_start = trial_times['rise_t'][trial] - 3 # Start window 3s before trial start
-            window_end = trial_times['fall_t'][trial] + 3 # End window 3s after trial end
-            start_idx = int(np.round(100 * window_start)) # Get index in 10 ms binned spiking
-            end_idx = int(np.round(100 * window_end)) # -||-
-            trial_aligned_spikes[unit].append(spikes[start_idx:end_idx])
-
-    return trial_aligned_spikes
-
 def match_unit_firing_to_trial_start(smoothed_spikes, trial_times):
     """
 
@@ -196,11 +191,15 @@ def match_unit_firing_to_trial_start(smoothed_spikes, trial_times):
             and end times in seconds
     
     returns:
-        dict: {unit: {trial: np.array(spikes)}}        
+        trial_aligned_spikes (dict): {unit: {trial: np.array(spikes)}}        
     """
     n_trials = len(trial_times['duration'])
     max_duration = np.max(trial_times['duration']) + 6 # Get max duration + 6 seconds either side
     max_duration_bins = int(np.round(100 * max_duration)) # Convert max duration into bins of 10 ms
+    print(max_duration_bins)
+    # Cap trial lengths at 25s to account for aberrant durations
+    if max_duration_bins > 2500:
+        max_duration_bins = 2500
     trial_aligned_spikes = {}
     for unit, spikes in smoothed_spikes.items():
         trial_aligned_spikes[unit] = np.empty((n_trials, max_duration_bins))
@@ -211,7 +210,10 @@ def match_unit_firing_to_trial_start(smoothed_spikes, trial_times):
             end_idx = int(np.round(100 * window_end)) # -||-
             spike_array = np.array(spikes[start_idx:end_idx])
             pad_length = max_duration_bins - len(spike_array)
-            trial_aligned_spikes[unit][trial,:] = np.pad(spike_array, (0, pad_length), constant_values=np.nan)
+            if pad_length < 0:
+                trial_aligned_spikes[unit][trial,:] = spike_array[:max_duration_bins]
+            else:
+                trial_aligned_spikes[unit][trial,:] = np.pad(spike_array, (0, pad_length), constant_values=np.nan)
 
     return trial_aligned_spikes
 
@@ -240,12 +242,26 @@ def subset_trials(aligned_spikes, trial_type_data, indexed_brain_regions, behav_
         'IsHit', 'IsLateBlock', 'IsMiss', 'IsProbe'
     ]
     
-    if behav_key not in valid_trial_types:
-        raise KeyError(f"Not a valid trial type: {behav_key}")
+    if isinstance(behav_key, str):
+        assert behav_key in valid_trial_types, f'Invalid trial type. Trial type must be one of {valid_trial_types}'
+        trial_filter = np.array(trial_type_data[behav_key]).flatten()  # shape (n_trials,)
+        trial_filter = trial_filter.astype(bool)
+    
+    elif isinstance(behav_key, list) or isinstance(behav_key, tuple):
+        assert all([item in valid_trial_types for item in behav_key]), f'Invalid trial type. Trial type must be one of {valid_trial_types}'
+        n_trials, n_keys = np.array(trial_type_data[behav_key[0]]).flatten(), len(behav_key)
+        
+        # Make empty array to contain the filter for each trial type and fill with trial filters
+        trial_filter_arr = np.empty((n_trials, n_keys)) 
+        for idx, key in enumerate(behav_key):
+            trial_filter_arr[:, idx] = np.array(trial_type_data[key]).flatten()
+        trial_filter_arr = trial_filter_arr.astype(bool)
+        
+        # Final trial filter is of shape (n_trials,) where True if all individual filters are True
+        trial_filter = np.sum(trial_filter_arr) == n_keys
+        print(trial_filter.shape, n_trials, n_keys)
 
     subset_spikes = {}
-    trial_filter = np.array(trial_type_data[behav_key]).flatten()  # shape (n_trials,)
-    trial_filter = trial_filter.astype(bool)
 
     for unit_idx, unit in enumerate(aligned_spikes.keys()):
         trial_matrix = aligned_spikes[unit]  # All data for unit; shape == (n_trials, max_duration_bins)
@@ -275,6 +291,7 @@ def plot_fa_vs_hit(FA, hit, mouse_no, sess_no, brain_regions, unit_ids):
         plt.title(f'{brain_regions[i]}, M: {mouse_no}, S: {sess_no}, U: {unit_ids[0][i]}')
         plt.vlines(0, min(np.concatenate((FA_to_plot, hit_to_plot))), max(np.concatenate((FA_to_plot, hit_to_plot))), 'k', '--')
         plt.legend()
+
 
 
 if __name__ == "__main__":
