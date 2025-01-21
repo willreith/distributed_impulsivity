@@ -77,7 +77,6 @@ def _resolve_reference_array(ref_array, file_handle):
 
 def get_session_data(data_fname, mouse_no, sess_no):
     with h5py.File(data_fname, 'r') as f:
-        # 1-indexed, if #0 is '#refs#'
         sess_data = f[mouse_no][sess_no]
 
         # Convert each relevant HDF5 group to a Python object
@@ -217,6 +216,7 @@ def match_unit_firing_to_trial_start(smoothed_spikes, trial_times):
 
     return trial_aligned_spikes
 
+
 def remove_spikes_before_motion_onset(aligned_spikes, trial_start, motion_onset_times, window=1):
     motion_onset_in_trial = motion_onset_times - trial_start # Get motion onset relative to trial start
     motion_onset_in_trial = np.round(motion_onset_in_trial * 100) # Convert to scale compatible with 10 ms spike bins
@@ -224,14 +224,32 @@ def remove_spikes_before_motion_onset(aligned_spikes, trial_start, motion_onset_
     for unit, trial_matrix in aligned_spikes.items():
         # trial_matrix.shape == (n_trials, max_duration_bins)
         for trial_idx in range(trial_matrix.shape[0]):
-            mo = motion_onset_in_trial[trial_idx]
+            mo = motion_onset_in_trial[trial_idx] # Motion onset bin number
             if not np.isnan(mo):
                 # Add 300 bins to account for 3 s prior to trial start
                 mo = int(mo + 300)
                 # Remove spikes from `mo - window_in_bins` to the end of the row
-                mo_start = max(mo - 100 * window, 0)
+                mo_start = max(mo - 100 * window, 0) # Removes 100 * window, so if window is 1, removes 100 bins, i.e., 1s
                 motion_cleaned_spikes[unit][trial_idx, mo_start:] = np.nan
     return motion_cleaned_spikes
+
+
+def remove_spikes_before_change_onset(aligned_spikes, trial_start, change_onset_times):
+    change_onset_in_trial = change_onset_times - trial_start # Get change onset relative to trial start
+    change_onset_in_trial = np.round(change_onset_in_trial * 100) # Convert to scale compatible with 10 ms spike bins
+    change_cleaned_spikes = copy.deepcopy(aligned_spikes)
+    for unit, trial_matrix in aligned_spikes.items():
+        # trial_matrix.shape == (n_trials, max_duration_bins)
+        for trial_idx in range(trial_matrix.shape[0]):
+            change_on = change_onset_in_trial[trial_idx]
+            if not np.isnan(change_on):
+                # Add 300 bins to account for 3 s prior to trial start
+                change_on = int(change_on + 300)
+                # Remove spikes from `change_on - window_in_bins` to the end of the row
+                change_start = max(change_on, 0) # Window parameter
+                change_cleaned_spikes[unit][trial_idx, change_start:] = np.nan
+    return change_cleaned_spikes
+
 
 def subset_trials(aligned_spikes, trial_type_data, indexed_brain_regions, behav_key="IsFA", region=None):
     """
@@ -249,7 +267,7 @@ def subset_trials(aligned_spikes, trial_type_data, indexed_brain_regions, behav_
     
     elif isinstance(behav_key, list) or isinstance(behav_key, tuple):
         assert all([item in valid_trial_types for item in behav_key]), f'Invalid trial type. Trial type must be one of {valid_trial_types}'
-        n_trials, n_keys = np.array(trial_type_data[behav_key[0]]).flatten(), len(behav_key)
+        n_trials, n_keys = np.array(trial_type_data[behav_key[0]]).flatten().shape[0], len(behav_key)
         
         # Make empty array to contain the filter for each trial type and fill with trial filters
         trial_filter_arr = np.empty((n_trials, n_keys)) 
@@ -258,8 +276,7 @@ def subset_trials(aligned_spikes, trial_type_data, indexed_brain_regions, behav_
         trial_filter_arr = trial_filter_arr.astype(bool)
         
         # Final trial filter is of shape (n_trials,) where True if all individual filters are True
-        trial_filter = np.sum(trial_filter_arr) == n_keys
-        print(trial_filter.shape, n_trials, n_keys)
+        trial_filter = np.sum(trial_filter_arr, axis=1) == n_keys
 
     subset_spikes = {}
 

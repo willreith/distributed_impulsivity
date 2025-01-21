@@ -1,7 +1,8 @@
+
+#%%
 import numpy as np
 import matplotlib.pyplot as plt
 from funcs import *
-
 
 DATA_FNAME = "/ceph/mrsic_flogel/public/projects/WiRe_20241218_DistributedImpulsivity/DMDM_NPX_curated_VidSes_AllAdded_cleaned_August2022_struct.mat"
 
@@ -44,7 +45,7 @@ MAX_TRIAL_DURATION = 2500
 N_CELLS = 15406
 
 
-def process_probe_data(probe_data, n_probes, events, video, motion_corr=True):
+def process_probe_data(probe_data, n_probes, events, video, motion_corr=True, change_corr=True):
     """ 
     Function to aggregate post-processing steps (matching spikes to clusters, binning, smoothing 
     and removing motion onset times).
@@ -76,11 +77,16 @@ def process_probe_data(probe_data, n_probes, events, video, motion_corr=True):
         
         # Align and clean spike data
         aligned_spikes = match_unit_firing_to_trial_start(smoothed_spikes_binned, trial_times)
-        if motion_corr:
-            motion_onset_times = np.array(video['MotionOnsetTimes']).flatten()
+        motion_onset_times = np.array(video['MotionOnsetTimes']).flatten()
+        change_onset_times = events['Change_ON']['rise_t'].flatten()
+        if motion_corr & change_corr:
+            corrected_spikes = remove_spikes_before_motion_onset(aligned_spikes, trial_times['rise_t'], motion_onset_times)
+            return remove_spikes_before_change_onset(corrected_spikes, trial_times['rise_t'], change_onset_times)
+        elif change_corr:
+            return remove_spikes_before_change_onset(aligned_spikes, trial_times['rise_t'], change_onset_times)
+        elif motion_corr:
             return remove_spikes_before_motion_onset(aligned_spikes, trial_times['rise_t'], motion_onset_times)
-        else: 
-            return aligned_spikes
+        return aligned_spikes
 
     if n_probes == 1:
         spike_times = np.array(probe_data['st'])
@@ -115,12 +121,12 @@ def aggregate_data(data, dim0, dim1, dtype=np.float64, pad=True):
     cell_array = np.empty((dim0, dim1), dtype=dtype)
     curr_start_index = 0
     for mouse in data.keys(): 
-        for sess in sessions[mouse]:
+        for sess in data[mouse].keys():
             for probe in data[mouse][sess]:
                 curr_data = data[mouse][sess][probe]
                 curr_n_cells, curr_max_trial_duration = curr_data.shape[0], curr_data.shape[1]
                 if pad:
-                    pad_length = dim1 - curr_max_trial_duration
+                    pad_length = dim1 - curr_max_trial_duration if curr_max_trial_duration < dim1 else 0
                     curr_data = np.pad(curr_data, pad_width=((0, 0), (0, pad_length)), constant_values=np.nan)
                 curr_end_index = curr_start_index + curr_n_cells
                 cell_array[curr_start_index:curr_end_index] = curr_data
@@ -128,7 +134,7 @@ def aggregate_data(data, dim0, dim1, dtype=np.float64, pad=True):
     return cell_array
 
 
-def get_results(mice, sessions, behav_key="IsFA", brain_region=None, brain_region_list_key='brain_region_comb'):
+def get_results(mice, sessions, behav_key="IsFA", brain_region=None, brain_region_list_key='brain_region_comb', motion_corr=True, change_corr=True):
     results = {}
     for mouse in mice: 
         results[mouse] = {}
@@ -138,7 +144,7 @@ def get_results(mice, sessions, behav_key="IsFA", brain_region=None, brain_regio
             events, probes, video, behav = get_session_data(DATA_FNAME, mouse, sess)
             trial_type_data = behav['trials_data_exp']
             n_probes = len(probes['offset'])
-            spikes_cleaned = process_probe_data(probes, n_probes, events, video)
+            spikes_cleaned = process_probe_data(probes, n_probes, events, video, motion_corr=motion_corr, change_corr=change_corr)
 
             max_dur = 0
 
@@ -147,7 +153,7 @@ def get_results(mice, sessions, behav_key="IsFA", brain_region=None, brain_regio
                 # Get spike data
                 curr_brain_regions = convert_regions_to_strings(probes['good_and_stab_cl_coord'][brain_region_list_key])
                 trials_of_interest = subset_trials(spikes_cleaned, trial_type_data, curr_brain_regions, behav_key=behav_key, region=brain_region)
-                n_timepoints = trials_of_interest.shape[0]
+                n_timepoints = trials_of_interest[list(trials_of_interest.keys())[0]].shape[1]
                 max_dur = n_timepoints if n_timepoints > max_dur else max_dur
                 results[mouse][sess][0] = average_over_trials(trials_of_interest)
 
@@ -157,12 +163,13 @@ def get_results(mice, sessions, behav_key="IsFA", brain_region=None, brain_regio
                     # Get spike data
                     curr_brain_regions = convert_regions_to_strings(probes['good_and_stab_cl_coord'][probe][0][brain_region_list_key])
                     trials_of_interest = subset_trials(spikes_cleaned[probe], trial_type_data, curr_brain_regions, behav_key=behav_key, region=brain_region)
+                    n_timepoints = trials_of_interest[list(trials_of_interest.keys())[0]].shape[1]
                     max_dur = n_timepoints if n_timepoints > max_dur else max_dur
                     results[mouse][sess][probe] = average_over_trials(trials_of_interest)
 
     max_dur = max_dur if max_dur < 2500 else 2500 # Set to prevent too large array from erroneously timed trials
-    n_cells_total = _get_n_cells(results)
-    return aggregate_data(results, n_cells_total, max_dur)
+    return results, max_dur
+
 
 
 def get_metadata(mice, sessions, behav_key='IsFA', time_lock='trialStart'):
@@ -309,117 +316,11 @@ def get_baseline_mean_and_std(mice, sessions, behav_key='IsHit', brain_region=No
 
     return flatten_baseline_dict(results, mice, sessions)
 
-
-
-hit_all = 0
-if hit_all:
-    # Get data
-    events, probes, video, behav = get_session_data(DATA_FNAME, MOUSE_NO, SESS_NO)
-
-    # Find is_FA, clusters, cluster labels, spike times, motion onset times
-    spike_times = np.array(probes['st'])
-    clusters = np.array(probes['clu'])
-    cluster_gs = probes['cluster_id_good_and_stable']
-    brain_regions = convert_regions_to_strings(probes['good_and_stab_cl_coord']['brain_region'])
-    brain_regions_comb = convert_regions_to_strings(probes['good_and_stab_cl_coord']['brain_region_comb'])
-
-    # Get trial start, finish and duration, regardless of trial performance
-    trial_start = events['Baseline_ON']['rise_t'].flatten()
-    baseline_off = events['Baseline_ON']['fall_t'].flatten()
-    change_off = events['Change_ON']['fall_t'].flatten()
-    trial_times = get_trial_times(trial_start, baseline_off, change_off)
-
-    # Match clusters to spike times
-    matched_spikes = match_clusters_and_spike_times(clusters, spike_times)
-
-    # Bin and smooth FRs
-    session_duration = np.max(spike_times)
-    matched_spikes_binned = bin_spike_times(matched_spikes, session_duration)
-    smoothed_spikes_binned = smooth_firing(matched_spikes_binned)
-
-    # Align FRs to trial start
-    aligned_spikes = match_unit_firing_to_trial_start(smoothed_spikes_binned, trial_times)
-
-    # Remove spikes after and 1s before motion onset
-    motion_onset_times = np.array(video['MotionOnsetTimes']).flatten()
-    motion_cleaned_spikes = remove_spikes_before_motion_onset(aligned_spikes, trial_start, motion_onset_times)
-
-    # Get FRs on early lick trials
-    trial_type_data = behav['trials_data_exp']
-    early_lick_frs = subset_trials(motion_cleaned_spikes, trial_type_data, brain_regions_comb, behav_key="IsFA", region=None)
-    hit_trials_frs = subset_trials(motion_cleaned_spikes, trial_type_data, brain_regions_comb, behav_key="IsHit", region=None)
-
-    # Get averages for each unit and trial type
-    FA = average_over_trials(early_lick_frs)
-    hit = average_over_trials(hit_trials_frs)
-    diff = hit - FA
-    mean_diff = np.nanmean(diff[:300])
-
-    # Make some plots
-    #plot_fa_vs_hit(diff, diff, MOUSE_NO, SESS_NO, brain_regions_comb, cluster_gs)
-
-functionless = False
-if functionless:
-    results = {}
-    info = {}
-    behav_key = "IsFA"
-    time_lock = 'trialStart'
-    for mouse in mice: 
-        results[mouse] = {}
-        info[mouse] = {}
-        for sess in sessions[mouse]:
-            results[mouse][sess] = {}
-            info[mouse][sess] = {}
-            print(mouse, sess)
-            events, probes, video, behav = get_session_data(DATA_FNAME, mouse, sess)
-            trial_type_data = behav['trials_data_exp']
-            n_probes = len(probes['offset'])
-            spikes_cleaned = process_probe_data(probes, n_probes, events, video)
-
-            # Handle single probe
-            if n_probes == 1:
-                # Get spike data
-                brain_regions = convert_regions_to_strings(probes['good_and_stab_cl_coord']['brain_region'])
-                brain_regions_comb = convert_regions_to_strings(probes['good_and_stab_cl_coord']['brain_region_comb'])
-                trials_of_interest = subset_trials(spikes_cleaned, trial_type_data, brain_regions_comb, behav_key=behav_key, region=None)
-                results[mouse][sess][0] = average_over_trials(trials_of_interest)
-
-                # Get metadata
-                n_cells = len(brain_regions_comb)
-                ap_position = probes['good_and_stab_cl_coord']['y']
-                curr_info = np.empty((n_cells, 8), dtype='object')
-                curr_info[:, :3] = mouse, sess, 0
-                curr_info[:, 3] = brain_regions_comb
-                curr_info[:, 4] = brain_regions
-                curr_info[:, 5] = ap_position
-                curr_info[:, 6] = behav_key
-                curr_info[:, 7] = time_lock
-                info[mouse][sess][0] = curr_info
-
-            # Or handle multiple probes
-            elif n_probes > 1:
-                for probe in range(n_probes):
-                    # Get spike data
-                    brain_regions = convert_regions_to_strings(probes['good_and_stab_cl_coord'][probe][0]['brain_region'])
-                    brain_regions_comb = convert_regions_to_strings(probes['good_and_stab_cl_coord'][probe][0]['brain_region_comb'])
-                    trials_of_interest = subset_trials(spikes_cleaned[probe], trial_type_data, brain_regions_comb, behav_key=behav_key, region=None)
-                    results[mouse][sess][probe] = average_over_trials(trials_of_interest)
-
-                    # Get metadata
-                    n_cells = len(brain_regions_comb)
-                    ap_position = probes['good_and_stab_cl_coord'][probe][0]['y']
-                    curr_info = np.empty((n_cells, 8), dtype='object')
-                    curr_info[:, :3] = mouse, sess, probe
-                    curr_info[:, 3] = brain_regions_comb
-                    curr_info[:, 4] = brain_regions
-                    curr_info[:, 5] = ap_position
-                    curr_info[:, 6] = behav_key
-                    curr_info[:, 7] = time_lock
-                    info[mouse][sess][probe] = curr_info
-
-
-
-
 # np.savez_compressed('/data/earlyLick_trialStart_all', early_lick_data=results, metadata=metadata)
 # fname = "data/baseline_mean_std_1sBeforeTrialStart-trialStart_hit_all"
 # np.save(fname, baseline)
+
+#%%
+results, max_dur = get_results(mice, sessions, behav_key=('IsHit', 'IsLateBlock'), time_lock='trialStart', change_corr=True)
+n_cells_total = _get_n_cells(results)
+final_results =  aggregate_data(results, n_cells_total, max_dur)
